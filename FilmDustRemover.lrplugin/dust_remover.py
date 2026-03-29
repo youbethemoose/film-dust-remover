@@ -1,109 +1,33 @@
 #!/usr/bin/env python3
 """
 Film Dust Remover — dust_remover.py
-Detects and removes dust from film scans captured on a Sony A7IV
+Detects and removes dust spots from film scans captured on a Sony A7IV
 (~33 MP, nearly full 35 mm frame coverage, ~190 px/mm).
 
-Subject Protection
+Detection strategy
 ──────────────────
-If MediaPipe is available, we detect the subject's face and body and build
-a protection mask. The dust remover will NOT touch any pixel inside that
-zone — preventing false positives on eyebrows, eyelashes, and hair.
-If MediaPipe is not installed the plugin falls back to the standard
-circularity-filtered detection with no subject protection.
+Dust shows up as a local dark (or bright) anomaly against a median-filtered
+reference. After thresholding we run connected-component analysis and keep
+only regions whose area falls within realistic dust-particle bounds — small
+enough to exclude real image content, large enough to exclude film grain.
 
-Dust Detection
-──────────────
-1. Light Gaussian blur   — removes single-pixel grain noise
-2. Median reference      — local "clean" reference scaled to image resolution
-3. Difference maps       — dark and bright local anomalies
-4. Size filter           — keeps only realistic dust-particle sizes
-5. Circularity filter    — rejects elongated shapes (eyelashes, hair strands)
-6. Protection mask       — zeroes out any detected dust inside subject regions
-7. NS inpainting         — smooth 4 px radius fill, no ghosting
+Hair detection is intentionally omitted: elongated-shape heuristics cannot
+reliably distinguish a film-hair artifact from actual hair on a subject.
 """
 
 import sys
 import os
 import argparse
-
 import cv2
 import numpy as np
-from typing import Optional, Tuple
-
-# ── Optional MediaPipe import ─────────────────────────────────────────────────
-# mp.solutions was removed in MediaPipe 0.10.14+. We catch AttributeError so
-# the plugin degrades gracefully on any version rather than crashing.
-try:
-    import mediapipe as mp
-    _ = mp.solutions.selfie_segmentation   # probe — raises AttributeError if gone
-    MP_AVAILABLE = True
-except (ImportError, AttributeError):
-    MP_AVAILABLE = False
-
-
-
-# ─── Subject Protection ───────────────────────────────────────────────────────
-
-def _protection_via_mediapipe(image_bgr: np.ndarray,
-                               image_rgb: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Face-only protection using MediaPipe face mesh.
-    Only protects the face region (eyes, eyebrows, skin texture) — NOT the
-    full body — so dust on clothing, hair, and background is still removed.
-    """
-    h, w = image_bgr.shape[:2]
-    protection = np.zeros((h, w), dtype=np.uint8)
-
-    with mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=6,
-            refine_landmarks=True,
-            min_detection_confidence=0.4) as fm:
-        result = fm.process(image_rgb)
-        if result.multi_face_landmarks:
-            for face in result.multi_face_landmarks:
-                pts = np.array([[int(lm.x * w), int(lm.y * h)]
-                                for lm in face.landmark], dtype=np.int32)
-                cv2.fillPoly(protection, [cv2.convexHull(pts)], 255)
-            return protection
-
-    return None
-
-
-def build_protection_mask(image_bgr: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Returns a uint8 mask (same H×W as image) where 255 = protected (subject).
-    Uses MediaPipe when available; returns None (no protection) otherwise so
-    the circularity filter handles portrait false positives on its own.
-    """
-    if not MP_AVAILABLE:
-        return None
-
-    h, w = image_bgr.shape[:2]
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    protection = _protection_via_mediapipe(image_bgr, image_rgb)
-
-    if protection is None:
-        return None
-
-    # Dilate by ~1 % of image width for a comfortable safety margin
-    margin = max(10, w // 100)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                   (margin * 2 + 1, margin * 2 + 1))
-    protection = cv2.dilate(protection, k)
-
-    pct = np.sum(protection > 0) / (h * w) * 100
-    print(f'PROTECT: face mask covers {pct:.1f}% of image')
-    return protection
 
 
 # ─── Detection ────────────────────────────────────────────────────────────────
 
-def detect(image_8bit: np.ndarray, sensitivity: int,
-           protection: Optional[np.ndarray]) -> Tuple[np.ndarray, dict]:
+def detect(image_8bit: np.ndarray, sensitivity: int) -> tuple[np.ndarray, dict]:
     """
     Returns (mask, stats_dict).
+
     mask   — uint8 binary map of pixels to inpaint
     stats  — diagnostic counts for logging
     """
@@ -112,94 +36,105 @@ def detect(image_8bit: np.ndarray, sensitivity: int,
 
     gray = cv2.cvtColor(image_8bit, cv2.COLOR_BGR2GRAY)
 
-    # ── 1. Light Gaussian — kills single-pixel grain noise ────────────────────
+    # ── 1. Light Gaussian — kills single-pixel grain noise only ───────────────
     smooth = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # ── 2. Median reference ───────────────────────────────────────────────────
-    # Scaled to image diagonal so it bridges over the largest expected dust
-    # at Sony A7IV resolution (~190 px/mm on 35 mm film).
-    diag_px = np.sqrt(h * w)
-    med_k = int(diag_px * (0.003 + s * 0.008))
+    # ── 2. Median reference — local tonal context ─────────────────────────────
+    # Kernel must be large enough to bridge over the biggest expected dust.
+    # At 33 MP / ~190 px-per-mm, a 2 mm clump is ~380 px wide, so we need
+    # the kernel to be wider than that at high sensitivity.
+    # We scale with image diagonal: on a 33 MP A7IV scan this gives 25–75 px;
+    # on a smaller export it stays proportionally sensible.
+    diag_px_ref = np.sqrt(h * w)
+    med_k = int(diag_px_ref * (0.003 + s * 0.008))   # ~25–75 px at 33 MP
     if med_k % 2 == 0:
         med_k += 1
-    med_k = max(15, min(med_k, 101))
+    med_k = max(15, min(med_k, 101))                  # clamp 15–101
     reference = cv2.medianBlur(smooth, med_k)
 
-    # ── 3. Difference maps ────────────────────────────────────────────────────
-    diff_dark   = cv2.subtract(reference, smooth)
-    diff_bright = cv2.subtract(smooth, reference)
+    # ── 3. Difference maps (dark anomalies and bright anomalies) ──────────────
+    diff_dark   = cv2.subtract(reference, smooth)   # dust / hairs (positive film)
+    diff_bright = cv2.subtract(smooth, reference)   # bright scratches / hairs
 
-    dark_thresh   = max(12, int(48 - s * 36))
-    bright_thresh = max(18, int(65 - s * 47))
+    dark_thresh   = max(12, int(48 - s * 36))   # 12–48 DN
+    bright_thresh = max(18, int(65 - s * 47))   # 18–65 DN
 
     _, dark_mask   = cv2.threshold(diff_dark,   dark_thresh,   255, cv2.THRESH_BINARY)
     _, bright_mask = cv2.threshold(diff_bright, bright_thresh, 255, cv2.THRESH_BINARY)
     combined = cv2.bitwise_or(dark_mask, bright_mask)
 
-    # Close tiny gaps inside a single particle
+    # Close tiny gaps inside a single particle / hair strand
     k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k_close)
 
-    # ── 4. Size limits (resolution-aware) ─────────────────────────────────────
-    img_area      = h * w
+    # ── 4. Size-filter contours (dust only) ───────────────────────────────────
+    # Resolution-aware limits for Sony A7IV (~33 MP, ~190 px/mm on 35 mm frame)
+    #   0.5 mm particle  →  ~9,000 px²
+    #   1.0 mm particle  →  ~28,000 px²
+    #   2.0 mm clump     →  ~113,000 px²
+    # Scaled by image area so the plugin adapts to any export resolution.
+    img_area = h * w
+
+    # min: 3 px² — grain is 1–2 px, we skip it entirely
     min_dust_area = 3
+
+    # max dust: scales 0.02 %–0.30 % with sensitivity
+    #   at 33 MP, s=0.5  →  ~50,000 px²  (~260 px diam, ≈1.4 mm physical)
+    #   at 33 MP, s=1.0  →  ~98,000 px²  (~354 px diam, ≈1.9 mm physical)
     max_dust_area = max(500, img_area * (0.0002 + s * 0.0028))
 
-    # ── 5. Circularity threshold ───────────────────────────────────────────────
-    # Dust blobs: 0.40–1.0   → kept
-    # Eyelashes:  0.02–0.15  → always rejected
-    # Eyebrows:   0.15–0.30  → rejected
-    min_circularity = max(0.25, 0.52 - s * 0.22)
-
-    # ── 6. Component loop ─────────────────────────────────────────────────────
     result = np.zeros(gray.shape, dtype=np.uint8)
     n_dust = 0
     n_skip = 0
-    n_protected = 0
 
+    # CHAIN_APPROX_NONE keeps every contour point — needed for accurate perimeter
     contours_all, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
                                         cv2.CHAIN_APPROX_NONE)
+
+    # Circularity threshold: 4π·area / perimeter²
+    #   Perfect circle  = 1.0
+    #   Square          ≈ 0.79
+    #   3:1 rectangle   ≈ 0.48
+    #   Eyelash/strand  ≈ 0.02–0.15  ← way below threshold, always rejected
+    #   Eyebrow shape   ≈ 0.15–0.30  ← below threshold, rejected
+    #   Dust blob       ≈ 0.40–1.0   ← above threshold, kept
+    #
+    # We scale the threshold slightly with sensitivity so at low sensitivity
+    # only very round spots qualify; at high sensitivity irregular clumps
+    # (burst edges, fibre ends) are also accepted — but still well above the
+    # 0.05–0.15 range that eyelashes/eyebrows fall into.
+    min_circularity = max(0.25, 0.52 - s * 0.22)   # 0.30–0.52
 
     for cnt in contours_all:
         area = cv2.contourArea(cnt)
 
-        if area < min_dust_area or area > max_dust_area:
+        if area < min_dust_area:
             n_skip += 1
             continue
 
-        # Shape gate
+        if area > max_dust_area:
+            n_skip += 1
+            continue
+
+        # Shape gate — reject anything elongated (eyelashes, eyebrows, hairs)
         perimeter = cv2.arcLength(cnt, True)
-        circularity = (4 * np.pi * area / perimeter ** 2
+        circularity = (4 * np.pi * area / (perimeter ** 2)
                        if perimeter > 0 else 0.0)
+
         if circularity < min_circularity:
             n_skip += 1
             continue
 
-        # Protection gate — skip if centroid lands inside subject mask
-        if protection is not None:
-            M = cv2.moments(cnt)
-            if M['m00'] > 0:
-                cx = int(M['m10'] / M['m00'])
-                cy = int(M['m01'] / M['m00'])
-                if protection[cy, cx] > 0:
-                    n_protected += 1
-                    continue
-
         cv2.drawContours(result, [cnt], -1, 255, -1)
         n_dust += 1
 
-    # ── 7. Dilate mask to cover edges ─────────────────────────────────────────
-    dil = max(1, int(1 + s * 2))
+    # ── 5. Dilate mask to fully cover edges ───────────────────────────────────
+    dil = max(1, int(1 + s * 2))   # 1–3 px
     k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                        (dil * 2 + 1, dil * 2 + 1))
     result = cv2.dilate(result, k_dil)
 
-    # Never inpaint inside the protection zone even after dilation
-    if protection is not None:
-        result[protection > 0] = 0
-
     stats = {'dust': n_dust, 'skipped': n_skip,
-             'protected': n_protected,
              'total_candidates': len(contours_all)}
     return result, stats
 
@@ -207,6 +142,12 @@ def detect(image_8bit: np.ndarray, sensitivity: int,
 # ─── Inpainting ───────────────────────────────────────────────────────────────
 
 def inpaint_image(image_8bit: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Navier-Stokes inpainting, small fixed radius.
+    NS produces smoother, less streaky fills than TELEA on film grain texture.
+    Radius 4 px is large enough to bridge dust/hair but small enough to
+    prevent ghosting / smearing.
+    """
     return cv2.inpaint(image_8bit, mask, inpaintRadius=4, flags=cv2.INPAINT_NS)
 
 
@@ -225,44 +166,30 @@ def process(input_path: str, output_path: str,
     print(f'INFO:    {os.path.basename(input_path)}  '
           f'{image.shape[1]}×{image.shape[0]}  '
           f'{"16-bit" if is_16bit else "8-bit"}  '
-          f'sensitivity={sensitivity}  '
-          f'mediapipe={"yes" if MP_AVAILABLE else "no (fallback mode)"}')
+          f'sensitivity={sensitivity}')
 
     image_8bit = (image >> 8).astype(np.uint8) if is_16bit else image.copy()
 
-    # ── Subject protection mask ────────────────────────────────────────────────
-    protection = build_protection_mask(image_8bit)
-    if protection is None and MP_AVAILABLE:
-        print('PROTECT: no subject detected — full image will be processed')
-    elif not MP_AVAILABLE:
-        print('PROTECT: MediaPipe not installed — run setup.sh to enable '
-              'subject protection')
-
     # ── Detect ─────────────────────────────────────────────────────────────────
-    mask, stats = detect(image_8bit, sensitivity, protection)
+    mask, stats = detect(image_8bit, sensitivity)
 
     dust_px = int(np.sum(mask > 0))
     pct     = dust_px / (image.shape[0] * image.shape[1]) * 100
 
-    print(f'DETECT:  dust={stats["dust"]}  '
-          f'protected={stats["protected"]}  '
-          f'skipped={stats["skipped"]}  '
+    print(f'DETECT:  dust={stats["dust"]}  skipped={stats["skipped"]}  '
           f'mask={dust_px}px ({pct:.4f}%)')
 
     if pct > 2.0:
-        print('WARNING: mask >2% of image — try lowering sensitivity.',
-              file=sys.stderr)
+        print('WARNING: Mask >2% of image — possible over-detection. '
+              'Try lowering sensitivity.', file=sys.stderr)
 
     if debug:
         mask_path = output_path.rsplit('.', 1)[0] + '_mask.tif'
         cv2.imwrite(mask_path, mask)
-        if protection is not None:
-            prot_path = output_path.rsplit('.', 1)[0] + '_protection.tif'
-            cv2.imwrite(prot_path, protection)
-        print(f'DEBUG:   masks saved alongside output')
+        print(f'DEBUG:   mask → {mask_path}')
 
     if dust_px == 0:
-        print('INFO:    No dust detected — saving clean copy')
+        print('INFO:    No artifacts detected — saving clean copy')
         cv2.imwrite(output_path, image)
         return
 
@@ -270,6 +197,7 @@ def process(input_path: str, output_path: str,
     result_8bit = inpaint_image(image_8bit, mask)
 
     if is_16bit:
+        # Only replace masked pixels; unmasked pixels keep full 16-bit precision
         result    = image.copy()
         mask_bool = mask > 0
         for c in range(image.shape[2]):
@@ -290,11 +218,12 @@ def process(input_path: str, output_path: str,
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Film Dust Remover')
+    parser = argparse.ArgumentParser(description='Film Dust & Hair Remover')
     parser.add_argument('input')
     parser.add_argument('output')
     parser.add_argument('--sensitivity', type=int, default=50)
-    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--debug', action='store_true',
+                        help='Save detection mask alongside output')
     args = parser.parse_args()
 
     if not (1 <= args.sensitivity <= 100):
