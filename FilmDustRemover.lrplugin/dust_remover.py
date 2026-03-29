@@ -47,18 +47,13 @@ except (ImportError, AttributeError):
 
 def _protection_via_mediapipe(image_bgr: np.ndarray,
                                image_rgb: np.ndarray) -> Optional[np.ndarray]:
-    """Full-body + face-mesh protection using MediaPipe (best quality)."""
+    """
+    Face-only protection using MediaPipe face mesh.
+    Only protects the face region (eyes, eyebrows, skin texture) — NOT the
+    full body — so dust on clothing, hair, and background is still removed.
+    """
     h, w = image_bgr.shape[:2]
     protection = np.zeros((h, w), dtype=np.uint8)
-    found = False
-
-    with mp.solutions.selfie_segmentation.SelfieSegmentation(
-            model_selection=1) as seg:
-        result = seg.process(image_rgb)
-        if result.segmentation_mask is not None:
-            person = (result.segmentation_mask > 0.5).astype(np.uint8) * 255
-            protection = cv2.bitwise_or(protection, person)
-            found = True
 
     with mp.solutions.face_mesh.FaceMesh(
             static_image_mode=True,
@@ -71,9 +66,9 @@ def _protection_via_mediapipe(image_bgr: np.ndarray,
                 pts = np.array([[int(lm.x * w), int(lm.y * h)]
                                 for lm in face.landmark], dtype=np.int32)
                 cv2.fillPoly(protection, [cv2.convexHull(pts)], 255)
-            found = True
+            return protection
 
-    return protection if found else None
+    return None
 
 
 def build_protection_mask(image_bgr: np.ndarray) -> Optional[np.ndarray]:
@@ -88,7 +83,6 @@ def build_protection_mask(image_bgr: np.ndarray) -> Optional[np.ndarray]:
     h, w = image_bgr.shape[:2]
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     protection = _protection_via_mediapipe(image_bgr, image_rgb)
-    method = 'mediapipe'
 
     if protection is None:
         return None
@@ -100,7 +94,7 @@ def build_protection_mask(image_bgr: np.ndarray) -> Optional[np.ndarray]:
     protection = cv2.dilate(protection, k)
 
     pct = np.sum(protection > 0) / (h * w) * 100
-    print(f'PROTECT: {method} — subject mask covers {pct:.1f}% of image')
+    print(f'PROTECT: face mask covers {pct:.1f}% of image')
     return protection
 
 
