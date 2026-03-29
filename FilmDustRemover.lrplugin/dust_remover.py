@@ -87,8 +87,23 @@ def detect(image_8bit: np.ndarray, sensitivity: int) -> tuple[np.ndarray, dict]:
     n_dust = 0
     n_skip = 0
 
+    # CHAIN_APPROX_NONE keeps every contour point — needed for accurate perimeter
     contours_all, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
+                                        cv2.CHAIN_APPROX_NONE)
+
+    # Circularity threshold: 4π·area / perimeter²
+    #   Perfect circle  = 1.0
+    #   Square          ≈ 0.79
+    #   3:1 rectangle   ≈ 0.48
+    #   Eyelash/strand  ≈ 0.02–0.15  ← way below threshold, always rejected
+    #   Eyebrow shape   ≈ 0.15–0.30  ← below threshold, rejected
+    #   Dust blob       ≈ 0.40–1.0   ← above threshold, kept
+    #
+    # We scale the threshold slightly with sensitivity so at low sensitivity
+    # only very round spots qualify; at high sensitivity irregular clumps
+    # (burst edges, fibre ends) are also accepted — but still well above the
+    # 0.05–0.15 range that eyelashes/eyebrows fall into.
+    min_circularity = max(0.25, 0.52 - s * 0.22)   # 0.30–0.52
 
     for cnt in contours_all:
         area = cv2.contourArea(cnt)
@@ -97,11 +112,21 @@ def detect(image_8bit: np.ndarray, sensitivity: int) -> tuple[np.ndarray, dict]:
             n_skip += 1
             continue
 
-        if area <= max_dust_area:
-            cv2.drawContours(result, [cnt], -1, 255, -1)
-            n_dust += 1
-        else:
+        if area > max_dust_area:
             n_skip += 1
+            continue
+
+        # Shape gate — reject anything elongated (eyelashes, eyebrows, hairs)
+        perimeter = cv2.arcLength(cnt, True)
+        circularity = (4 * np.pi * area / (perimeter ** 2)
+                       if perimeter > 0 else 0.0)
+
+        if circularity < min_circularity:
+            n_skip += 1
+            continue
+
+        cv2.drawContours(result, [cnt], -1, 255, -1)
+        n_dust += 1
 
     # ── 5. Dilate mask to fully cover edges ───────────────────────────────────
     dil = max(1, int(1 + s * 2))   # 1–3 px
