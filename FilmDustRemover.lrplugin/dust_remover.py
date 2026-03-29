@@ -41,13 +41,6 @@ try:
 except (ImportError, AttributeError):
     MP_AVAILABLE = False
 
-# ── OpenCV Haar cascade — always available, used when MediaPipe is absent ─────
-_FACE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-)
-_PROFILE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_profileface.xml'
-)
 
 
 # ─── Subject Protection ───────────────────────────────────────────────────────
@@ -83,60 +76,19 @@ def _protection_via_mediapipe(image_bgr: np.ndarray,
     return protection if found else None
 
 
-def _protection_via_opencv(image_bgr: np.ndarray) -> Optional[np.ndarray]:
-    """Face-box protection using OpenCV Haar cascades (no extra dependencies)."""
-    h, w = image_bgr.shape[:2]
-    protection = np.zeros((h, w), dtype=np.uint8)
-
-    # Scale down for speed — detection works fine at ~1200px wide
-    scale = min(1.0, 1200.0 / max(h, w))
-    gray  = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    small = cv2.resize(gray, None, fx=scale, fy=scale)
-
-    faces = []
-    for cascade in (_FACE_CASCADE, _PROFILE_CASCADE):
-        if cascade.empty():
-            continue
-        found = cascade.detectMultiScale(small, scaleFactor=1.1,
-                                          minNeighbors=4, minSize=(30, 30))
-        if len(found):
-            faces.extend(found.tolist())
-
-    if not faces:
-        return None
-
-    for (x, y, fw, fh) in faces:
-        # Scale back to full resolution
-        x, y, fw, fh = (int(v / scale) for v in (x, y, fw, fh))
-        # Generous padding: extra room above for hair, below for neck/shoulders
-        pad_x   = int(fw * 0.5)
-        pad_top = int(fh * 1.0)   # hair above
-        pad_bot = int(fh * 0.5)   # neck / shoulders below
-        x1 = max(0, x - pad_x)
-        y1 = max(0, y - pad_top)
-        x2 = min(w, x + fw + pad_x)
-        y2 = min(h, y + fh + pad_bot)
-        cv2.rectangle(protection, (x1, y1), (x2, y2), 255, -1)
-
-    return protection
-
-
 def build_protection_mask(image_bgr: np.ndarray) -> Optional[np.ndarray]:
     """
     Returns a uint8 mask (same H×W as image) where 255 = protected (subject).
-    Tries MediaPipe first (best quality), falls back to OpenCV Haar cascade.
-    Returns None if no subject detected.
+    Uses MediaPipe when available; returns None (no protection) otherwise so
+    the circularity filter handles portrait false positives on its own.
     """
-    h, w = image_bgr.shape[:2]
-    protection = None
+    if not MP_AVAILABLE:
+        return None
 
-    if MP_AVAILABLE:
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        protection = _protection_via_mediapipe(image_bgr, image_rgb)
-        method = 'mediapipe'
-    else:
-        protection = _protection_via_opencv(image_bgr)
-        method = 'opencv-cascade'
+    h, w = image_bgr.shape[:2]
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    protection = _protection_via_mediapipe(image_bgr, image_rgb)
+    method = 'mediapipe'
 
     if protection is None:
         return None
