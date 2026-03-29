@@ -31,44 +31,42 @@ import cv2
 import numpy as np
 from typing import Optional, Tuple
 
-# ── Optional MediaPipe import ──────────────────────────────────────────────────
+# ── Optional MediaPipe import ─────────────────────────────────────────────────
+# mp.solutions was removed in MediaPipe 0.10.14+. We catch AttributeError so
+# the plugin degrades gracefully on any version rather than crashing.
 try:
     import mediapipe as mp
+    _ = mp.solutions.selfie_segmentation   # probe — raises AttributeError if gone
     MP_AVAILABLE = True
-except ImportError:
+except (ImportError, AttributeError):
     MP_AVAILABLE = False
+
+# ── OpenCV Haar cascade — always available, used when MediaPipe is absent ─────
+_FACE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+)
+_PROFILE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_profileface.xml'
+)
 
 
 # ─── Subject Protection ───────────────────────────────────────────────────────
 
-def build_protection_mask(image_bgr: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Returns a uint8 mask (same H×W as image) where 255 = protected (subject),
-    0 = safe to process (background / film rebate).
-    Returns None if MediaPipe is unavailable or no subject is detected.
-    """
-    if not MP_AVAILABLE:
-        return None
-
+def _protection_via_mediapipe(image_bgr: np.ndarray,
+                               image_rgb: np.ndarray) -> Optional[np.ndarray]:
+    """Full-body + face-mesh protection using MediaPipe (best quality)."""
     h, w = image_bgr.shape[:2]
     protection = np.zeros((h, w), dtype=np.uint8)
-    found_anything = False
+    found = False
 
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-
-    # ── Selfie segmentation — separates full person from background ───────────
     with mp.solutions.selfie_segmentation.SelfieSegmentation(
             model_selection=1) as seg:
         result = seg.process(image_rgb)
         if result.segmentation_mask is not None:
-            # Threshold: pixels with confidence > 0.5 are "person"
             person = (result.segmentation_mask > 0.5).astype(np.uint8) * 255
             protection = cv2.bitwise_or(protection, person)
-            found_anything = True
+            found = True
 
-    # ── Face mesh — extra protection around eyes and eyebrows ─────────────────
-    # Even if selfie segmentation missed something near the face, the face
-    # mesh gives us precise coverage of the most sensitive areas.
     with mp.solutions.face_mesh.FaceMesh(
             static_image_mode=True,
             max_num_faces=6,
@@ -77,27 +75,80 @@ def build_protection_mask(image_bgr: np.ndarray) -> Optional[np.ndarray]:
         result = fm.process(image_rgb)
         if result.multi_face_landmarks:
             for face in result.multi_face_landmarks:
-                pts = np.array(
-                    [[int(lm.x * w), int(lm.y * h)]
-                     for lm in face.landmark],
-                    dtype=np.int32
-                )
-                # Convex hull of all 468 landmarks covers the whole face
-                hull = cv2.convexHull(pts)
-                cv2.fillPoly(protection, [hull], 255)
-            found_anything = True
+                pts = np.array([[int(lm.x * w), int(lm.y * h)]
+                                for lm in face.landmark], dtype=np.int32)
+                cv2.fillPoly(protection, [cv2.convexHull(pts)], 255)
+            found = True
 
-    if not found_anything:
+    return protection if found else None
+
+
+def _protection_via_opencv(image_bgr: np.ndarray) -> Optional[np.ndarray]:
+    """Face-box protection using OpenCV Haar cascades (no extra dependencies)."""
+    h, w = image_bgr.shape[:2]
+    protection = np.zeros((h, w), dtype=np.uint8)
+
+    # Scale down for speed — detection works fine at ~1200px wide
+    scale = min(1.0, 1200.0 / max(h, w))
+    gray  = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, None, fx=scale, fy=scale)
+
+    faces = []
+    for cascade in (_FACE_CASCADE, _PROFILE_CASCADE):
+        if cascade.empty():
+            continue
+        found = cascade.detectMultiScale(small, scaleFactor=1.1,
+                                          minNeighbors=4, minSize=(30, 30))
+        if len(found):
+            faces.extend(found.tolist())
+
+    if not faces:
         return None
 
-    # Dilate protection zone by ~1 % of image width to add a comfortable margin
+    for (x, y, fw, fh) in faces:
+        # Scale back to full resolution
+        x, y, fw, fh = (int(v / scale) for v in (x, y, fw, fh))
+        # Generous padding: extra room above for hair, below for neck/shoulders
+        pad_x   = int(fw * 0.5)
+        pad_top = int(fh * 1.0)   # hair above
+        pad_bot = int(fh * 0.5)   # neck / shoulders below
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_top)
+        x2 = min(w, x + fw + pad_x)
+        y2 = min(h, y + fh + pad_bot)
+        cv2.rectangle(protection, (x1, y1), (x2, y2), 255, -1)
+
+    return protection
+
+
+def build_protection_mask(image_bgr: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Returns a uint8 mask (same H×W as image) where 255 = protected (subject).
+    Tries MediaPipe first (best quality), falls back to OpenCV Haar cascade.
+    Returns None if no subject detected.
+    """
+    h, w = image_bgr.shape[:2]
+    protection = None
+
+    if MP_AVAILABLE:
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        protection = _protection_via_mediapipe(image_bgr, image_rgb)
+        method = 'mediapipe'
+    else:
+        protection = _protection_via_opencv(image_bgr)
+        method = 'opencv-cascade'
+
+    if protection is None:
+        return None
+
+    # Dilate by ~1 % of image width for a comfortable safety margin
     margin = max(10, w // 100)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin * 2 + 1,
-                                                       margin * 2 + 1))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                   (margin * 2 + 1, margin * 2 + 1))
     protection = cv2.dilate(protection, k)
 
-    protected_pct = np.sum(protection > 0) / (h * w) * 100
-    print(f'PROTECT: subject mask covers {protected_pct:.1f}% of image')
+    pct = np.sum(protection > 0) / (h * w) * 100
+    print(f'PROTECT: {method} — subject mask covers {pct:.1f}% of image')
     return protection
 
 

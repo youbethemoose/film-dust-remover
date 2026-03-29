@@ -24,13 +24,14 @@ echo "✓ Python found: $PYTHON ($($PYTHON --version))"
 # Install dependencies
 echo ""
 echo "Installing dependencies..."
-$PYTHON -m pip install --quiet --upgrade opencv-python-headless numpy mediapipe
+# mediapipe pinned to <0.10.14 — the solutions API was removed in 0.10.14+
+$PYTHON -m pip install --quiet --upgrade opencv-python-headless numpy "mediapipe>=0.10.0,<0.10.14"
 
 # Verify
-if $PYTHON -c "import cv2, numpy, mediapipe" 2>/dev/null; then
+if $PYTHON -c "import cv2, numpy, mediapipe; _ = mediapipe.solutions.selfie_segmentation" 2>/dev/null; then
     echo "✓ opencv-python-headless installed"
     echo "✓ numpy installed"
-    echo "✓ mediapipe installed (subject protection enabled)"
+    echo "✓ mediapipe installed (full subject protection enabled)"
     echo ""
     echo "All dependencies ready."
     echo "You can now add FilmDustRemover.lrplugin to Lightroom Classic via:"
