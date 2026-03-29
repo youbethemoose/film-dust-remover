@@ -1,0 +1,22 @@
+# Snapshots / backups — don't ship these
+*_snapshot_*/
+*_backup_*/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Lightroom catalog files (if someone clones into a catalog folder)
+*.lrcat
+*.lrcat-wal
+*.lrdata/
+
+# Temp files from the plugin itself
+/tmp/FilmDustRemover_*/
+*_mask.tif
+*_clean*.tif
