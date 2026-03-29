@@ -24,12 +24,13 @@ echo "✓ Python found: $PYTHON ($($PYTHON --version))"
 # Install dependencies
 echo ""
 echo "Installing dependencies..."
-$PYTHON -m pip install --quiet --upgrade opencv-python-headless numpy
+$PYTHON -m pip install --quiet --upgrade opencv-python-headless numpy mediapipe
 
 # Verify
-if $PYTHON -c "import cv2, numpy" 2>/dev/null; then
+if $PYTHON -c "import cv2, numpy, mediapipe" 2>/dev/null; then
     echo "✓ opencv-python-headless installed"
     echo "✓ numpy installed"
+    echo "✓ mediapipe installed (subject protection enabled)"
     echo ""
     echo "All dependencies ready."
     echo "You can now add FilmDustRemover.lrplugin to Lightroom Classic via:"
