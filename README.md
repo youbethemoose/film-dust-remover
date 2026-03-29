@@ -114,6 +114,20 @@ Hair/squiggle detection is intentionally not included — elongated shape heuris
 
 ---
 
+## What May Need Work
+
+This plugin is a work in progress and does a solid job on most film scans — but there are known situations where it still struggles:
+
+**Portraits with fine hair, eyelashes, and eyebrows**
+The biggest ongoing challenge. Even with a circularity filter in place to reject elongated shapes, certain fine facial details — particularly stray hairs across skin, thick eyelashes, or eyebrow edges — can still register as dust-like anomalies depending on the lighting and background tone of the scan. We're aware of this and it's being actively mulled over. For now, portraits with a lot of fine hair detail are best run at a lower sensitivity (30–45) or skipped until a better solution is worked out.
+
+**Subjects with hair against light backgrounds**
+Similar to the above — dark hair strands against a bright background (sky, white wall, etc.) can occasionally fool the detector into thinking they're dust. Again, lower sensitivity helps here.
+
+Both of these come down to a hard fundamental problem: dust and fine dark detail can look nearly identical to a computer vision algorithm. Solving it properly likely means introducing some scene-awareness (knowing where faces and hair are before deciding what's dust) — which is on the roadmap.
+
+---
+
 ## Troubleshooting
 
 **Plugin doesn't appear in File → Plug-in Extras**
