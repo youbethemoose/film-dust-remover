@@ -29,6 +29,7 @@ import argparse
 
 import cv2
 import numpy as np
+from typing import Optional, Tuple
 
 # ── Optional MediaPipe import ──────────────────────────────────────────────────
 try:
@@ -40,7 +41,7 @@ except ImportError:
 
 # ─── Subject Protection ───────────────────────────────────────────────────────
 
-def build_protection_mask(image_bgr: np.ndarray) -> np.ndarray | None:
+def build_protection_mask(image_bgr: np.ndarray) -> Optional[np.ndarray]:
     """
     Returns a uint8 mask (same H×W as image) where 255 = protected (subject),
     0 = safe to process (background / film rebate).
@@ -103,7 +104,7 @@ def build_protection_mask(image_bgr: np.ndarray) -> np.ndarray | None:
 # ─── Detection ────────────────────────────────────────────────────────────────
 
 def detect(image_8bit: np.ndarray, sensitivity: int,
-           protection: np.ndarray | None) -> tuple[np.ndarray, dict]:
+           protection: Optional[np.ndarray]) -> Tuple[np.ndarray, dict]:
     """
     Returns (mask, stats_dict).
     mask   — uint8 binary map of pixels to inpaint
