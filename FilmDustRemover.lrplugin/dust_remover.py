@@ -57,7 +57,7 @@ def detect(image_8bit: np.ndarray, sensitivity: int) -> tuple[np.ndarray, dict]:
     diff_bright = cv2.subtract(smooth, reference)   # bright scratches / hairs
 
     dark_thresh   = max(12, int(48 - s * 36))   # 12–48 DN
-    bright_thresh = max(18, int(65 - s * 47))   # 18–65 DN
+    bright_thresh = max(12, int(50 - s * 36))   # 12–50 DN  (film dust is bright)
 
     _, dark_mask   = cv2.threshold(diff_dark,   dark_thresh,   255, cv2.THRESH_BINARY)
     _, bright_mask = cv2.threshold(diff_bright, bright_thresh, 255, cv2.THRESH_BINARY)
